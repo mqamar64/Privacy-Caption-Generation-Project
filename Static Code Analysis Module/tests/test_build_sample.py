@@ -1,0 +1,96 @@
+"""Integration test on input/APK/sample.apk (F-Droid). Takes ~1 minute.
+
+Run with:  pytest -m slow
+"""
+
+from collections import defaultdict
+from pathlib import Path
+
+import pytest
+
+from apg.builder import APGBuilder, BuildOptions
+from apg.export import read_csv, write_csv
+
+SAMPLE = Path(__file__).resolve().parents[1] / "input" / "APK" / "sample.apk"
+
+pytestmark = [pytest.mark.slow,
+              pytest.mark.skipif(not SAMPLE.exists(), reason="sample.apk not present")]
+
+
+@pytest.fixture(scope="module")
+def apg():
+    return APGBuilder(SAMPLE, BuildOptions(stmt_scope="app")).build()
+
+
+def _out(g):
+    out = defaultdict(list)
+    for rel in ("DATA_DEP", "ARG", "RETURN", "WRITES_FIELD", "READ_BY"):
+        for a, b, _ in g.edges[rel]:
+            out[a].append(b)
+    return out
+
+
+def test_manifest_and_symbols(apg):
+    app = next(iter(apg.nodes["App"].values()))
+    assert app["package"] == "org.fdroid.fdroid"
+    perms = {p["name"] for p in apg.nodes["Permission"].values() if p.get("requested")}
+    assert "android.permission.ACCESS_WIFI_STATE" in perms
+    main = [c for c in apg.nodes["Component"].values() if c.get("is_main")]
+    assert main and main[0]["name"] == "org.fdroid.fdroid.views.main.MainActivity"
+    assert any(l["name"] == "OkHttp" for l in apg.nodes["Library"].values())
+
+
+def test_every_edge_endpoint_exists(apg):
+    uids = {u for nodes in apg.nodes.values() for u in nodes}
+    for rel, edges in apg.edges.items():
+        for a, b, _ in edges:
+            assert a in uids and b in uids, (rel, a, b)
+
+
+def test_ssid_flows_into_sharing_uri(apg):
+    """WifiInfo.getSSID() -> FDroidApp.ssid -> Uri.Builder.appendQueryParameter()."""
+    S = apg.nodes["Statement"]
+    out = _out(apg)
+    src = [u for u, s in S.items() if s.get("target_name") == "getSSID"]
+    assert src
+    seen, todo = set(src), list(src)
+    while todo:
+        for nxt in out[todo.pop()]:
+            if nxt not in seen:
+                seen.add(nxt)
+                todo.append(nxt)
+    reached = {S[u].get("target_name") for u in seen if u in S}
+    assert "appendQueryParameter" in reached
+
+
+def test_entrypoint_reaches_getssid(apg):
+    M = apg.nodes["Method"]
+    calls = defaultdict(set)
+    for a, b, _ in apg.edges["CALLS"]:
+        calls[a].add(b)
+    target = next(u for u, m in M.items()
+                  if m["class_name"] == "android.net.wifi.WifiInfo" and m["name"] == "getSSID")
+    entries = [u for u, m in M.items() if m.get("is_entrypoint")]
+    seen, todo = set(entries), list(entries)
+    while todo:
+        for nxt in calls[todo.pop()]:
+            if nxt not in seen:
+                seen.add(nxt)
+                todo.append(nxt)
+    assert target in seen
+
+
+def test_csv_round_trip(apg, tmp_path):
+    write_csv(apg, tmp_path)
+    g2 = read_csv(tmp_path)
+    assert g2.app_id == apg.app_id
+    assert g2.counts() == apg.counts()
+    def present(props):
+        # empty lists are stored as missing, as in Neo4j
+        return {k: v for k, v in props.items() if v is not None and v != []}
+
+    for label in ("Method", "Statement", "Component"):
+        for uid, props in list(apg.nodes[label].items())[:500]:
+            assert present(g2.nodes[label][uid]) == present(props)
+    no_arg = next(m for m in g2.nodes["Method"].values() if m["param_count"] == 0)
+    assert no_arg["param_types"] == ""
