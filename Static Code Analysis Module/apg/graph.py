@@ -24,38 +24,43 @@ STATEMENT = "Statement"
 
 NODE_LABELS = (APP, PERMISSION, COMPONENT, LIBRARY, CLASS, METHOD, FIELD, PARAMETER, STATEMENT)
 
-# --- Relationship types: (type, from label(s), to label(s), meaning) --------------
-EDGE_TYPES: dict[str, tuple[str, str, str]] = {
+# --- Relationship types: type -> (from label(s), to label(s), layer, meaning) ---------
+# Layers follow VulHunter's APG (AST, MCG, ICFG, SDG), plus the manifest.
+EDGE_TYPES: dict[str, tuple[str, str, str, str]] = {
     # Manifest
-    "USES_PERMISSION":         (APP, PERMISSION, "App requests the permission (<uses-permission>)"),
-    "DECLARES_PERMISSION":     (APP, PERMISSION, "App defines a custom permission (<permission>)"),
-    "HAS_COMPONENT":           (APP, COMPONENT, "Activity / service / receiver / provider in the manifest"),
-    "IMPLEMENTED_BY":          (COMPONENT, CLASS, "Class implementing the component"),
-    "GUARDED_BY":              (COMPONENT, PERMISSION, "Permission required to access the component"),
-    # Symbol table / structure (the APG's AST layer)
-    "HAS_CLASS":               (APP, CLASS, "Class defined in or referenced by the APK"),
-    "USES_LIBRARY":            (APP, LIBRARY, "Third-party SDK detected in the APK"),
-    "BELONGS_TO":              (CLASS, LIBRARY, "Class is part of a detected SDK"),
-    "EXTENDS":                 (CLASS, CLASS, "Superclass"),
-    "IMPLEMENTS":              (CLASS, CLASS, "Implemented interface"),
-    "HAS_METHOD":              (CLASS, METHOD, "Declared method"),
-    "HAS_FIELD":               (CLASS, FIELD, "Declared field"),
-    "HAS_PARAM":               (METHOD, PARAMETER, "Formal parameter (index 0 = this for instance methods)"),
-    "HAS_STATEMENT":           (METHOD, STATEMENT, "Bytecode statement inside the method"),
-    # Call graph
-    "CALLS":                   (METHOD, METHOD, "Method-level call graph edge (count = #call sites)"),
-    "OVERRIDES":               (METHOD, METHOD, "Method overrides / implements an ancestor method"),
-    "API_REQUIRES_PERMISSION": (METHOD, PERMISSION, "Framework API guarded by a permission (androguard mapping)"),
-    # Control flow
-    "ENTRY":                   (METHOD, STATEMENT, "First statement of the method body"),
-    "FLOWS_TO":                (STATEMENT, STATEMENT, "Intra-procedural control flow (exception=true for handlers)"),
-    "INVOKES":                 (STATEMENT, METHOD, "Call site -> resolved callee"),
-    # Data flow (def -> use direction, so taint paths follow edge direction)
-    "DATA_DEP":                ("Statement|Parameter", STATEMENT, "Reaching definition of register `reg` used here"),
-    "ARG":                     ("Statement|Parameter", PARAMETER, "Value passed as argument `index` at call site `call_site`"),
-    "RETURN":                  (STATEMENT, STATEMENT, "Callee return statement -> caller invoke (result consumed by move-result)"),
-    "WRITES_FIELD":            (STATEMENT, FIELD, "iput / sput"),
-    "READ_BY":                 (FIELD, STATEMENT, "iget / sget"),
+    "USES_PERMISSION":         (APP, PERMISSION, "Manifest", "App requests the permission (<uses-permission>)"),
+    "DECLARES_PERMISSION":     (APP, PERMISSION, "Manifest", "App defines a custom permission (<permission>)"),
+    "HAS_COMPONENT":           (APP, COMPONENT, "Manifest", "Activity / service / receiver / provider in the manifest"),
+    "IMPLEMENTED_BY":          (COMPONENT, CLASS, "Manifest", "Class implementing the component"),
+    "GUARDED_BY":              (COMPONENT, PERMISSION, "Manifest", "Permission required to access the component"),
+    # AST: program structure, the symbol table and its containment tree
+    "HAS_CLASS":               (APP, CLASS, "AST", "Class defined in or referenced by the APK"),
+    "USES_LIBRARY":            (APP, LIBRARY, "AST", "Third-party SDK detected in the APK"),
+    "BELONGS_TO":              (CLASS, LIBRARY, "AST", "Class is part of a detected SDK"),
+    "EXTENDS":                 (CLASS, CLASS, "AST", "Superclass"),
+    "IMPLEMENTS":              (CLASS, CLASS, "AST", "Implemented interface"),
+    "HAS_METHOD":              (CLASS, METHOD, "AST", "Declared method"),
+    "HAS_FIELD":               (CLASS, FIELD, "AST", "Declared field"),
+    "HAS_PARAM":               (METHOD, PARAMETER, "AST", "Formal parameter (index 0 = this for instance methods)"),
+    "HAS_STATEMENT":           (METHOD, STATEMENT, "AST", "Bytecode statement (operands in its defs/uses)"),
+    # MCG: method call graph
+    "CALLS":                   (METHOD, METHOD, "MCG", "Caller -> callee; count = call sites; via = callback|icc for implicit calls"),
+    "INVOKES":                 (STATEMENT, METHOD, "MCG", "Call site -> resolved callee (via = callback|icc for implicit calls)"),
+    "OVERRIDES":               (METHOD, METHOD, "MCG", "Method overrides / implements an ancestor method"),
+    "SENDS_INTENT":            (STATEMENT, COMPONENT, "MCG", "startActivity / startService / sendBroadcast target"),
+    "API_REQUIRES_PERMISSION": (METHOD, PERMISSION, "MCG", "Framework API guarded by a permission (androguard mapping)"),
+    # ICFG: interprocedural control flow
+    "ENTRY":                   (METHOD, STATEMENT, "ICFG", "First statement of the method body"),
+    "FLOWS_TO":                (STATEMENT, STATEMENT, "ICFG", "Next statement; branch = true|false|case:N|default|goto; exception=true into a handler"),
+    "CALL_FLOW":               (STATEMENT, STATEMENT, "ICFG", "Call site -> first statement of the callee"),
+    "RETURN_FLOW":             (STATEMENT, STATEMENT, "ICFG", "Callee return/throw -> call site"),
+    # SDG: system dependence graph (def -> use direction, so taint paths follow edges)
+    "DATA_DEP":                ("Statement|Parameter", STATEMENT, "SDG", "Reaching definition of register `reg` used here"),
+    "CONTROL_DEP":             (STATEMENT, STATEMENT, "SDG", "Branch statement decides whether this runs (branch = outcome)"),
+    "ARG":                     ("Statement|Parameter", PARAMETER, "SDG", "Value passed as argument `index` at call site `call_site`"),
+    "RETURN":                  (STATEMENT, STATEMENT, "SDG", "Callee return statement -> caller invoke (result consumed by move-result)"),
+    "WRITES_FIELD":            (STATEMENT, FIELD, "SDG", "iput / sput"),
+    "READ_BY":                 (FIELD, STATEMENT, "SDG", "iget / sget"),
 }
 
 

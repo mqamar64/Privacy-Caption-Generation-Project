@@ -36,12 +36,21 @@ def load_doc_analysis_apis() -> list[dict]:
 
 
 def split_queries(text: str) -> list[tuple[str, str]]:
-    out = []
-    for block in text.split(";"):
-        title = next((m.group(1) for m in re.finditer(r"//\s*(Q\d+\..*)", block)), None)
-        body = "\n".join(l for l in block.splitlines() if not l.strip().startswith("//")).strip()
-        if body:
-            out.append((title or "query", body))
+    """Split on lines ending in ';' (outside comments); a query's title is its Qn comment."""
+    out, body, title = [], [], None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("//"):
+            m = re.match(r"//\s*(Q\d+\..*)", stripped)
+            if m:
+                title = m.group(1)
+            continue
+        body.append(line)
+        if stripped.endswith(";"):
+            q = "\n".join(body).strip().rstrip(";")
+            if q:
+                out.append((title or "query", q))
+            body, title = [], None
     return out
 
 

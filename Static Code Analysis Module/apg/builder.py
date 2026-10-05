@@ -1,12 +1,13 @@
 """Build an App Property Graph (APG) from an APK with Androguard.
 
-Layers produced (see graph.EDGE_TYPES for the full relationship list):
-  * Manifest      - App, Permission, Component nodes
-  * Symbol table  - Class, Method, Field, Parameter nodes + EXTENDS/IMPLEMENTS/HAS_*
-  * Call graph    - CALLS (method level), INVOKES (call site level), OVERRIDES
-  * Control flow  - Statement nodes with ENTRY / FLOWS_TO (basic-block aware CFG)
-  * Data flow     - DATA_DEP (reaching definitions), ARG / RETURN (inter-procedural),
-                    WRITES_FIELD / READ_BY (heap through fields)
+Layers follow VulHunter's APG (AST, MCG, ICFG, SDG) plus the manifest; see
+graph.EDGE_TYPES for every relationship and the layer it belongs to:
+  * Manifest  - App, Permission, Component nodes
+  * AST       - Class, Method, Field, Parameter, Statement nodes and their containment
+  * MCG       - CALLS / INVOKES / OVERRIDES, including callbacks and Intents (callbacks.py)
+  * ICFG      - ENTRY / FLOWS_TO (with branch labels) / CALL_FLOW / RETURN_FLOW
+  * SDG       - DATA_DEP (reaching definitions), CONTROL_DEP (controldep.py),
+                ARG / RETURN (inter-procedural), WRITES_FIELD / READ_BY (fields)
 
 Statement-level layers are only built for classes inside ``stmt_scope`` because
 library code can be 20x larger than the app itself; the call graph always covers
@@ -23,7 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import dalvik
+from . import callbacks, dalvik
+from .controldep import control_dependence
 from .graph import (APG, APP, CLASS, COMPONENT, FIELD, LIBRARY, METHOD, PARAMETER,
                     PERMISSION, STATEMENT)
 from .libraries import OriginClassifier
@@ -64,6 +66,7 @@ class BuildOptions:
     stmt_scope: str = "nonlib"
     include_exception_edges: bool = True
     include_api_permission_mapping: bool = True
+    with_source: bool = True    # decompiled Java per method (for PRCS / captions)
 
 
 def class_dots(dalvik_name: str) -> str:
@@ -101,8 +104,13 @@ class APGBuilder:
         self._analysis = analysis
         self.stats: dict[str, Any] = {}
         self.component_classes: dict[str, str] = {}   # dotted class -> component type
-        self._pending_impl: list[tuple[str, str]] = []  # (component uid, class name)
+        self.pending_impl: list[tuple[str, str]] = []   # (component uid, class name)
         self._call_args: dict[str, tuple[str, list]] = {}  # call stmt -> (callee, args)
+        # Per-statement facts kept for callbacks.py (only for the opcodes it walks).
+        self.stmt_meta: dict[str, tuple] = {}     # stmt -> (op, regs, type_ref, target_class, literal)
+        self.use_defs: dict[str, dict] = {}       # stmt -> {register: reaching definitions}
+        self.registrations: list[tuple] = []      # calls into code without statements
+        self.overrides: dict[str, list[str]] = defaultdict(list)
 
     # ------------------------------------------------------------------ public
     def build(self) -> APG:
@@ -127,6 +135,7 @@ class APGBuilder:
         self._add_bodies()
         self._link_returns()
         self._add_overrides_and_entrypoints()
+        callbacks.link(self)
         if self.opts.include_api_permission_mapping:
             self._add_api_permissions()
         self.stats["apg_seconds"] = round(time.time() - t1, 1)
@@ -214,7 +223,7 @@ class APGBuilder:
             if tag == "activity-alias":
                 target = self._resolve_name(el.get(ANDROID_NS + "targetActivity"), pkg) or name
             self.component_classes.setdefault(target, ctype)
-            self._pending_impl.append((uid, target))
+            self.pending_impl.append((uid, target))
             for attr in ("permission", "readPermission", "writePermission"):
                 p = el.get(ANDROID_NS + attr)
                 if p:
@@ -244,7 +253,7 @@ class APGBuilder:
         self.class_info: dict[str, dict[str, Any]] = {}  # dalvik name -> info
         for ca in self.dx.get_classes():
             self._ensure_class(ca.name, ca)
-        for uid_comp, target in self._pending_impl:
+        for uid_comp, target in self.pending_impl:
             dname = "L" + target.replace(".", "/") + ";"
             if dname in self.class_info:
                 self.g.add_edge("IMPLEMENTED_BY", uid_comp, self._u("C", dname))
@@ -390,7 +399,10 @@ class APGBuilder:
         scope = STMT_SCOPES[self.opts.stmt_scope]
         self.calls: dict[tuple[str, str], int] = defaultdict(int)
         self.returns: dict[str, list[str]] = defaultdict(list)    # method uid -> return stmts
+        self.exits: dict[str, list[str]] = defaultdict(list)      # method uid -> return/throw stmts
+        self.entries: dict[str, str] = {}                         # method uid -> first stmt
         self.pending_returns: list[tuple[str, str]] = []          # (callee uid, call stmt uid)
+        self.pending_calls: list[tuple[str, str]] = []            # (callee uid, call stmt uid)
         self.params: dict[str, list[tuple[int, int, str]]] = {}   # method uid -> [(idx, reg, uid)]
         detailed = []
         for sig, ma in list(self.methods.items()):
@@ -407,6 +419,8 @@ class APGBuilder:
                 self._scan_calls(muid, m)
         for sig, ma in detailed:
             self._add_statements(sig, self.method_ids[sig], ma)
+        if self.opts.with_source:
+            self._add_sources(detailed)
         for (src, dst), n in self.calls.items():
             self.g.add_edge("CALLS", src, dst, count=n)
         self.stats["methods_with_statements"] = len(detailed)
@@ -444,10 +458,16 @@ class APGBuilder:
 
         # 1. Statements per basic block
         block_stmts: list[list[tuple[str, list, list]]] = []
-        uid_of_off: dict[int, str] = {}
+        block_last: list[tuple | None] = []    # (op, offset, operands) of each block's last instruction
+        ins_at: dict[int, Any] = {}            # offset -> instruction, payloads included
+        o = 0
+        for ins in m.get_instructions():
+            ins_at[o] = ins
+            o += ins.get_length()
         idx = 0
         for b, bb in enumerate(bbs):
             stmts = []
+            last = None
             off = bb.get_start()
             for ins in bb.get_instructions():
                 op = ins.get_name()
@@ -462,9 +482,14 @@ class APGBuilder:
                     operands = []
                 regs = [o[1] for o in operands if _is_register(o)]
                 ref = _ref_operand(ins, operands)
-                props = dict(method_signature=sig, offset=off, idx=idx, bb=b, opcode=op,
-                             kind=dalvik.instruction_kind(op), code=f"{op} {ins.get_output()}".strip())
+                type_ref = _type_operand(operands) if ref is None else None
                 defs, uses = dalvik.defs_and_uses(op, regs)
+                props = dict(method_signature=sig, offset=off, idx=idx, bb=b, opcode=op,
+                             kind=dalvik.instruction_kind(op), code=f"{op} {ins.get_output()}".strip(),
+                             defs=[_reg_name(r) for r in defs], uses=[_reg_name(r) for r in uses])
+                if type_ref:
+                    props["type_ref"] = dalvik.descriptor_to_java(type_ref)
+                last = (op, off, operands)
                 if op.startswith("invoke") and ref:
                     callee = self._resolve_method(ref)
                     tcls, tname, tdesc = dalvik.parse_method_ref(ref)
@@ -474,7 +499,8 @@ class APGBuilder:
                     g.add_node(STATEMENT, suid, **props)
                     g.add_edge("INVOKES", suid, callee)
                     self.calls[(muid, callee)] += 1
-                    self._record_call(suid, callee, regs, tdesc, op)
+                    self._record_call(muid, suid, callee, regs, tcls, tname, tdesc, op)
+                    self.stmt_meta[suid] = (op, regs, None, tcls, None)
                 elif op.startswith(("iget", "sget", "iput", "sput")) and ref:
                     fuid = self._resolve_field(ref)
                     props.update(target=ref)
@@ -484,31 +510,39 @@ class APGBuilder:
                     else:
                         g.add_edge("WRITES_FIELD", suid, fuid)
                 elif op.startswith("const-string"):
-                    props.update(literal=_string_literal(operands, ins))
+                    literal = _string_literal(operands, ins)
+                    props.update(literal=literal)
                     g.add_node(STATEMENT, suid, **props)
+                    self.stmt_meta[suid] = (op, regs, None, None, literal)
                 else:
                     if ref:
                         props.update(target=ref)
                     g.add_node(STATEMENT, suid, **props)
+                    if op in ("new-instance", "const-class", "check-cast") or op.startswith("move-object"):
+                        self.stmt_meta[suid] = (op, regs, type_ref, None, None)
                 if op.startswith("return"):
                     self.returns[muid].append(suid)
+                if op.startswith(("return", "throw")):
+                    self.exits[muid].append(suid)
                 g.add_edge("HAS_STATEMENT", muid, suid)
-                uid_of_off[off] = suid
                 stmts.append((suid, defs, uses))
                 off += length
                 idx += 1
             block_stmts.append(stmts)
+            block_last.append(last)
         g.nodes[METHOD][muid]["instruction_count"] = idx
         g.nodes[METHOD][muid]["has_statements"] = True
 
-        # 2. CFG edges
+        # 2. CFG edges, labelled with the branch outcome that takes them
         bb_index = {id(bb): i for i, bb in enumerate(bbs)}
         succs: list[list[tuple[int, bool]]] = [[] for _ in bbs]
+        labels: list[dict[int, str]] = [{} for _ in bbs]
         for i, bb in enumerate(bbs):
             for child in bb.childs:
                 j = bb_index.get(id(child[2]))
                 if j is not None and (j, False) not in succs[i]:
                     succs[i].append((j, False))
+                    labels[i][j] = _branch_label(block_last[i], bbs[j].get_start(), ins_at)
             if self.opts.include_exception_edges and bb.exception_analysis:
                 for exc in bb.exception_analysis.exceptions:
                     j = bb_index.get(id(exc[2])) if len(exc) > 2 and exc[2] is not None else None
@@ -517,6 +551,7 @@ class APGBuilder:
         first = next((s[0][0] for s in block_stmts if s), None)
         if first:
             g.add_edge("ENTRY", muid, first)
+            self.entries[muid] = first
         for i, stmts in enumerate(block_stmts):
             for (a, _, _), (b, _, _) in zip(stmts, stmts[1:]):
                 g.add_edge("FLOWS_TO", a, b, exception=False)
@@ -526,18 +561,39 @@ class APGBuilder:
             for j, is_exc in succs[i]:
                 tgt = _first_stmt(block_stmts, succs, j)
                 if tgt:
-                    g.add_edge("FLOWS_TO", last, tgt, exception=is_exc)
+                    if is_exc:
+                        g.add_edge("FLOWS_TO", last, tgt, exception=True)
+                    else:
+                        g.add_edge("FLOWS_TO", last, tgt, exception=False, branch=labels[i].get(j))
 
-        # 3. Reaching definitions -> DATA_DEP (and ARG edges for internal calls)
+        # 3. Control dependence: the branch statement -> every statement it decides on
+        normal = [[(j, labels[i].get(j) or "next") for j, exc in succs[i] if not exc]
+                  for i in range(len(bbs))]
+        for blk, controllers in control_dependence(normal).items():
+            merged: dict[int, list[str]] = defaultdict(list)
+            for a, label in controllers:
+                merged[a].append(label)
+            for a, labs in merged.items():
+                if not block_stmts[a]:
+                    continue
+                branch_stmt = block_stmts[a][-1][0]
+                for suid, _, _ in block_stmts[blk]:
+                    g.add_edge("CONTROL_DEP", branch_stmt, suid, branch="|".join(sorted(set(labs))))
+
+        # 4. Reaching definitions -> DATA_DEP (and ARG edges for internal calls)
         self._reaching_defs(muid, block_stmts, succs)
 
-    def _record_call(self, call_uid: str, callee_uid: str, regs: list[int],
-                             tdesc: str, op: str) -> None:
+    def _record_call(self, caller_uid: str, call_uid: str, callee_uid: str, regs: list[int],
+                     tcls: str, tname: str, tdesc: str, op: str) -> None:
         pdescs, ret = dalvik.split_method_descriptor(tdesc)
         args = dalvik.invoke_arg_registers(regs, pdescs, op.startswith("invoke-static"))
         self._call_args[call_uid] = (callee_uid, args)
+        self.pending_calls.append((callee_uid, call_uid))
         if ret != "V":
             self.pending_returns.append((callee_uid, call_uid))
+        if callee_uid not in self.params:
+            # Framework / SDK code we have no statements for: may call back into the app.
+            self.registrations.append((caller_uid, call_uid, tcls, tname, op, args, pdescs))
 
     def _reaching_defs(self, muid: str, block_stmts, succs) -> None:
         n = len(block_stmts)
@@ -583,6 +639,8 @@ class APGBuilder:
         for i, stmts in enumerate(block_stmts):
             state = dict(in_states[i])
             for suid, defs, uses in stmts:
+                if suid in self.stmt_meta:
+                    self.use_defs[suid] = {u: state.get(u, frozenset()) for u in uses}
                 for u in dict.fromkeys(uses):
                     for d in state.get(u, ()):
                         g.add_edge("DATA_DEP", d, suid, reg=_reg_name(u))
@@ -602,12 +660,42 @@ class APGBuilder:
         for callee_uid, call_uid in self.pending_returns:
             for ruid in self.returns.get(callee_uid, ()):
                 self.g.add_edge("RETURN", ruid, call_uid)
+        # Interprocedural control flow (ICFG): into the callee and back out of it.
+        for callee_uid, call_uid in self.pending_calls:
+            entry = self.entries.get(callee_uid)
+            if entry:
+                self.g.add_edge("CALL_FLOW", call_uid, entry)
+                for xuid in self.exits.get(callee_uid, ()):
+                    self.g.add_edge("RETURN_FLOW", xuid, call_uid)
         self.pending_returns.clear()
+        self.pending_calls.clear()
+
+    def _add_sources(self, detailed) -> None:
+        """Decompiled Java for each analysed method, the input PriGen-style captioning uses."""
+        try:
+            from loguru import logger
+            logger.disable("androguard")
+        except ImportError:
+            logger = None
+        t = time.time()
+        n = 0
+        for sig, ma in detailed:
+            try:
+                src = ma.get_method().get_source()
+            except Exception:
+                continue
+            if src:
+                self.g.nodes[METHOD][self.method_ids[sig]]["source"] = src.strip("\n")
+                n += 1
+        if logger:
+            logger.enable("androguard")
+        self.stats["methods_with_source"] = n
+        self.stats["source_seconds"] = round(time.time() - t, 1)
 
     # ------------------------------------------------- overrides & entrypoints
     def _add_overrides_and_entrypoints(self) -> None:
         g = self.g
-        overrides: dict[str, list[str]] = defaultdict(list)
+        overrides = self.overrides
         for sig in list(self.methods):
             cls, name, desc = dalvik.parse_method_ref(sig)
             muid = self.method_ids[sig]
@@ -699,6 +787,8 @@ class APGBuilder:
                 self.g.add_edge("API_REQUIRES_PERMISSION", muid, self._perm_node(p),
                                 source=f"androguard-api{PERMISSION_MAPPING_API}")
                 n += 1
+            node = self.g.nodes[METHOD][muid]
+            node["permissions"] = sorted(set(node.get("permissions") or []) | set(perms))
         self.stats["api_permission_edges"] = n
 
 
@@ -718,6 +808,42 @@ def _ref_operand(ins, operands: Iterable | None = None) -> str | None:
     for o in operands:
         if len(o) >= 3 and isinstance(o[2], str) and "->" in o[2]:
             return o[2]
+    return None
+
+
+def _type_operand(operands) -> str | None:
+    """Type reference of new-instance / const-class / check-cast / new-array."""
+    for o in operands:
+        if len(o) >= 3 and isinstance(o[2], str) and "->" not in o[2] and o[2][:1] in ("L", "["):
+            return o[2]
+    return None
+
+
+def _offset_operand(operands) -> int | None:
+    for o in operands:
+        if getattr(o[0], "name", None) == "OFFSET" and len(o) >= 2:
+            return o[1]
+    return None
+
+
+def _branch_label(last: tuple | None, child_start: int, ins_at: dict) -> str | None:
+    """Which outcome of a block's final instruction leads to the block at ``child_start``."""
+    if last is None:
+        return None
+    op, off, operands = last
+    imm = _offset_operand(operands)
+    if op.startswith("if-") and imm is not None:
+        return "true" if child_start == off + 2 * imm else "false"
+    if op in ("packed-switch", "sparse-switch") and imm is not None:
+        payload = ins_at.get(off + 2 * imm)
+        try:
+            keys, targets = payload.get_keys(), payload.get_targets()
+        except Exception:
+            return None
+        hits = [str(k) for k, t in zip(keys, targets) if off + 2 * t == child_start]
+        return ("case:" + ",".join(hits)) if hits else "default"
+    if op.startswith("goto"):
+        return "goto"
     return None
 
 

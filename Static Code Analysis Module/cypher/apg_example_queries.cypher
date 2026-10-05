@@ -78,3 +78,37 @@ OPTIONAL MATCH (c)-[:GUARDED_BY]->(p:Permission)
 RETURN c.type AS type, c.name AS component, c.intent_actions AS actions,
        collect(p.name) AS guarded_by
 ORDER BY type, component;
+
+// ---------------------------------------------------------------------------
+// Q8. Conditions: which checks decide whether a sensitive API call runs?
+//     (CONTROL_DEP; e.g. a permission check or a null check guarding the call)
+// ---------------------------------------------------------------------------
+MATCH (call:Statement {app_id: $app, kind: 'invoke'})-[:INVOKES]->(api:Method)
+WHERE api.permissions IS NOT NULL OR api.name IN ['getSSID', 'getLastKnownLocation', 'getDeviceId']
+MATCH (cond:Statement)-[c:CONTROL_DEP]->(call)
+OPTIONAL MATCH (check:Statement)-[:DATA_DEP*1..2]->(cond)
+WHERE check.kind = 'invoke'
+RETURN api.class_name + '.' + api.name AS api, call.method_signature AS in_method,
+       cond.code AS condition, c.branch AS when_branch,
+       collect(DISTINCT check.target_name) AS condition_uses
+LIMIT 25;
+
+// ---------------------------------------------------------------------------
+// Q9. Implicit calls: callbacks and Intents the framework will trigger
+// ---------------------------------------------------------------------------
+MATCH (s:Statement {app_id: $app})-[i:INVOKES]->(m:Method)
+WHERE i.via IN ['callback', 'icc']
+RETURN i.via AS kind, s.target_class + '.' + s.target_name AS registered_with,
+       m.class_name + '.' + m.name AS runs_later, count(*) AS sites
+ORDER BY sites DESC LIMIT 25;
+
+// ---------------------------------------------------------------------------
+// Q10. PRCS for captions: methods up to 3 call hops above a permission-guarded API,
+//      with their decompiled Java (the code segments PriGen/PDroid caption)
+// ---------------------------------------------------------------------------
+MATCH (api:Method {app_id: $app})-[:API_REQUIRES_PERMISSION]->(p:Permission)
+MATCH path = (m:Method)-[:CALLS*1..3]->(api)
+WHERE m.source IS NOT NULL
+RETURN api.class_name + '.' + api.name AS api, collect(DISTINCT p.name) AS permissions,
+       m.class_name + '.' + m.name AS method, length(path) AS hops, m.source AS java
+ORDER BY api, hops LIMIT 20;

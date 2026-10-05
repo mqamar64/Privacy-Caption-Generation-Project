@@ -80,6 +80,38 @@ def test_entrypoint_reaches_getssid(apg):
     assert target in seen
 
 
+def test_branch_labels_and_control_dependence(apg):
+    """getSSID() only runs when the preceding BSSID null-check is false."""
+    S = apg.nodes["Statement"]
+    labels = {p.get("branch") for _, _, p in apg.edges["FLOWS_TO"]}
+    assert {"true", "false", "goto"} <= labels
+    src = next(u for u, s in S.items() if s.get("target_name") == "getSSID")
+    ctrl = [(S[a], p["branch"]) for a, b, p in apg.edges["CONTROL_DEP"] if b == src]
+    assert ctrl and ctrl[0][0]["opcode"] == "if-eqz" and ctrl[0][1] == "false"
+
+
+def test_callbacks_and_intents(apg):
+    S, M, C = apg.nodes["Statement"], apg.nodes["Method"], apg.nodes["Component"]
+    cb = {(S[a]["target_name"], M[b]["class_name"], M[b]["name"])
+          for a, b, p in apg.edges["INVOKES"] if p.get("via") == "callback"}
+    assert ("start", "org.fdroid.fdroid.nearby.WifiStateChangeService$WifiInfoThread", "run") in cb
+    assert all(M[b]["origin"] in ("app", "unknown")
+               for _, b, p in apg.edges["INVOKES"] if p.get("via") == "callback")
+    explicit = {C[b]["name"] for _, b, p in apg.edges["SENDS_INTENT"] if p["explicit"]}
+    assert "org.fdroid.fdroid.views.AppDetailsActivity" in explicit
+    on_create = [M[b] for _, b, p in apg.edges["INVOKES"]
+                 if p.get("via") == "icc" and M[b]["class_name"].endswith("AppDetailsActivity")]
+    assert any(m["name"] == "onCreate" for m in on_create)
+
+
+def test_interprocedural_control_flow(apg):
+    S = apg.nodes["Statement"]
+    calls = [(a, b) for a, b, _ in apg.edges["CALL_FLOW"]]
+    assert calls
+    a, b = calls[0]
+    assert S[a]["kind"] == "invoke" and S[b]["idx"] == 0
+
+
 def test_csv_round_trip(apg, tmp_path):
     write_csv(apg, tmp_path)
     g2 = read_csv(tmp_path)

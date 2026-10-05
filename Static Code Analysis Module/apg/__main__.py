@@ -49,7 +49,8 @@ def cmd_build(args) -> None:
         sys.exit(f"no .apk files found at {src}")
     opts = BuildOptions(stmt_scope=args.stmt_scope,
                         include_exception_edges=not args.no_exception_edges,
-                        include_api_permission_mapping=not args.no_api_permissions)
+                        include_api_permission_mapping=not args.no_api_permissions,
+                        with_source=not args.no_source)
     for apk in apks:
         print(f"[apg] analysing {apk}")
         b = APGBuilder(apk, opts)
@@ -85,6 +86,8 @@ def main(argv=None) -> None:
     b.add_argument("--no-exception-edges", action="store_true")
     b.add_argument("--no-api-permissions", action="store_true",
                    help="skip androguard's API->permission mapping")
+    b.add_argument("--no-source", action="store_true",
+                   help="skip decompiled Java on methods (used for PRCS / caption code segments)")
     b.add_argument("--no-csv", action="store_true")
     b.add_argument("--neo4j", action="store_true", help="also load into Neo4j")
     _neo4j_args(b)
