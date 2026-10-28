@@ -156,6 +156,11 @@ apg/
   __main__.py      CLI
 cypher/apg_example_queries.cypher   Q1–Q10: building blocks for the PPG
 scripts/run_example_queries.py      runs them with the Document Analysis CSVs as $apis
+cypher/ppg_build.cypher             P0–P13, V, E: filters the method APGs into PPGs
+cypher/ppg_for_method.cypher        one query for one PPG: is this method's APG a PPG, and why
+cypher/demo_queries.cypher          queries for presenting the APG and PPGs
+cypher/video_demo.cypher            the PPG build split into numbered paste blocks
+scripts/build_ppg.py                runs ppg_build.cypher, validates, exports one JSON per PPG
 tests/                              unit tests + sample.apk integration tests
 ```
 
@@ -167,6 +172,75 @@ replaces `androguard_analysis_APG_*.py` and fixes these problems in them:
   `move-result` was not connected to its call.
 - Node ids had no app scope, so loading two APKs mixed their graphs.
 - Paths were hard-coded to Windows folders.
+
+## Building the Privacy Property Graphs (PPGs)
+
+**One method = one APG.** The database holds every method's APG. Each Method node also
+carries its own APG as properties: `parameters`, `ast_table` (statements with operands),
+`cfg_table` (control flow with branch outcomes), `data_flow_table` (def → use per
+variable) and `method_call_table` (calls, with constant arguments such as `"wifi"`),
+plus `source` (decompiled Java). The same information is in the graph as nodes and edges,
+which is what the Cypher queries traverse.
+
+**A PPG is the method APG that itself makes a sensitive call**, wherever that method sits in
+the call hierarchy. The Cypher queries filter the method APGs down to the PPGs and record
+*why* each one qualifies:
+
+| Reason (`BECAUSE` edge) | Meaning |
+|---|---|
+| `calls_sensitive_api` | The method calls an API that returns personal data (`getSSID`, `getDeviceId` …) |
+| `requires_dangerous_permission` | It calls an API guarded by a dangerous (runtime) permission |
+| `receives_personal_data` | Android hands it personal data as a callback parameter (the `Location` in `onLocationChanged`) |
+
+A PPG includes everything inside its method's APG (`INCLUDES` every statement and
+parameter), and adds:
+- the data categories involved (`categories`, more than one when the method handles several kinds, e.g. financial + location);
+- where the data goes (`REACHES_SINK`, `HAS_FLOW` → `PrivacyFlow` with the evidence path and
+  `through_methods`, the methods it passes through; those methods are not separate PPGs);
+- the conditions guarding it (`GUARDED_BY_CONDITION`), permissions (`REQUIRES_PERMISSION`), SDKs (`IN_SDK`, `SHARES_WITH`);
+- the entry point that runs it (`TRIGGERED_BY`), and calls between PPGs (`CALLS_INTO`).
+
+Classification then labels each PPG.
+
+```bash
+NEO4J_PASSWORD=... ../.venv/bin/python scripts/build_ppg.py <app_id> --export output/ppg
+```
+
+This runs [`cypher/ppg_build.cypher`](cypher/ppg_build.cypher) in order:
+
+| Step | What it does |
+|---|---|
+| P0–P1 | Schema; remove the app's previous PPGs |
+| P2–P3 | Mark source APIs (a fixed list of APIs that *return* personal data) and where the app reads them |
+| P4–P5 | Mark sinks (logs, URLs, network, files, preferences, databases, Intents, clipboard, screen, SDKs) |
+| P6 | Candidate PPGs: method APGs with a direct reason |
+| P7 | Keep candidates an entry point reaches; others become `ExcludedPPG` |
+| P8–P9 | Privacy flows from each source to its sinks, and the methods each flow passes through |
+| P10–P11 | Link PPGs to their flows and sinks; include the whole method APG; PPG call tree |
+| P12–P13 | Conditions, permissions, SDKs, and the summary used by classification |
+| V1–V4 | Validation (V1, V3, V4 must be 0) |
+| E | Export: one JSON per PPG, including the method's tables and Java |
+
+**Wide mode:** `build_ppg.py <app_id> --wide` also uses the Document Analysis Module's ~6,200
+categorised sources. PPGs found only that way get `confidence: 'review'`. On F-Droid it adds 41
+reachable PPGs, almost all of them noise (e.g. `Calendar.getInstance` counted as calendar data,
+`ClassLoader.loadClass` as network data), so it is a tool for finding candidates to add to the
+curated list, not for final results.
+
+**One query for one PPG:** [`cypher/ppg_for_method.cypher`](cypher/ppg_for_method.cypher) takes one
+method and returns whether its APG is a PPG, why, its categories, where its data goes, which other
+methods' personal data passes through it, and its full APG (parameters, tables, Java).
+
+Rules that keep false positives out:
+- Only APIs that *return* personal data count as sources, and only dangerous permissions count as a reason.
+- A sink only counts when the data arrives at a specific argument (the message of `Log.d`, not its tag).
+- Paths may not pass through calls that turn the data into a yes/no or a number about it (`isEmpty`, `equals`, `length` …).
+- Methods no entry point reaches are excluded (V2 lists them for review).
+- Every PPG element is an existing APG node; V3 checks every evidence step is an existing APG edge.
+
+On F-Droid: 12 PPGs in about 10 seconds, all validation checks at 0. Queries for presenting them are
+in [`cypher/demo_queries.cypher`](cypher/demo_queries.cypher) (D9–D19) and, step by step for a
+screen recording, [`cypher/video_demo.cypher`](cypher/video_demo.cypher).
 
 ## Next steps toward the PPG
 

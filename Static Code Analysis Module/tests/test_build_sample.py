@@ -126,3 +126,27 @@ def test_csv_round_trip(apg, tmp_path):
             assert present(g2.nodes[label][uid]) == present(props)
     no_arg = next(m for m in g2.nodes["Method"].values() if m["param_count"] == 0)
     assert no_arg["param_types"] == ""
+
+
+def test_each_method_carries_its_own_apg_tables(apg):
+    """One method = one APG: parameters, AST, control flow, data flow and calls as properties."""
+    import json
+    m = next(v for v in apg.nodes["Method"].values()
+             if v["class_name"].endswith("WifiStateChangeService") and v["name"] == "setSsid")
+    assert m["parameters"] == ["0:this:org.fdroid.fdroid.nearby.WifiStateChangeService",
+                               "1:p1:android.net.wifi.WifiInfo"]
+    ast = json.loads(m["ast_table"])
+    assert len(ast) == m["instruction_count"]
+    calls = json.loads(m["method_call_table"])
+    assert any("getSSID" in c["callee"] for c in calls)
+    dft = json.loads(m["data_flow_table"])
+    assert {"from": "param1", "to": 12, "var": "v8"} in dft   # the WifiInfo parameter is used
+    assert json.loads(m["cfg_table"])
+
+
+def test_constant_arguments_are_properties(apg):
+    """setSsid strips quotes with ssid.replaceAll("^\"(.*)\"$", "$1")."""
+    S = apg.nodes["Statement"]
+    calls = [s for s in S.values() if s.get("target_name") == "replaceAll"
+             and s["method_signature"].endswith("WifiStateChangeService;->setSsid(Landroid/net/wifi/WifiInfo;)V")]
+    assert calls and calls[0]["const_args"] == ['1=^"(.*)"$', "2=$1"]

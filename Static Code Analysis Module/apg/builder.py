@@ -67,6 +67,7 @@ class BuildOptions:
     include_exception_edges: bool = True
     include_api_permission_mapping: bool = True
     with_source: bool = True    # decompiled Java per method (for PRCS / captions)
+    with_tables: bool = True    # per-method AST / CFG / data-flow / call tables as properties
 
 
 def class_dots(dalvik_name: str) -> str:
@@ -138,6 +139,8 @@ class APGBuilder:
         callbacks.link(self)
         if self.opts.include_api_permission_mapping:
             self._add_api_permissions()
+        if self.opts.with_tables:
+            self._add_method_tables()
         self.stats["apg_seconds"] = round(time.time() - t1, 1)
         self.stats.update(self.g.counts())
         return self.g
@@ -448,6 +451,10 @@ class APGBuilder:
             self.g.add_edge("HAS_PARAM", muid, uid, index=idx)
             out.append((idx, reg, uid))
         self.params[muid] = out
+        # Parameters are also kept as a property of the method: "index:name:type"
+        self.g.nodes[METHOD][muid]["parameters"] = [
+            f"{idx}:{'this' if (not is_static and idx == 0) else 'p' + str(idx)}:{dalvik.descriptor_to_java(t)}"
+            for (idx, _), t in zip(regs, types)]
 
     def _add_statements(self, sig: str, muid: str, ma) -> None:
         g = self.g
@@ -489,6 +496,11 @@ class APGBuilder:
                              defs=[_reg_name(r) for r in defs], uses=[_reg_name(r) for r in uses])
                 if type_ref:
                     props["type_ref"] = dalvik.descriptor_to_java(type_ref)
+                if op.startswith("const") and not op.startswith(("const-string", "const-class")):
+                    lit = next((o[1] for o in operands if getattr(o[0], "name", None) == "LITERAL"), None)
+                    if lit is not None:
+                        props["value"] = str(lit)
+                        self.stmt_meta[suid] = (op, regs, None, None, str(lit))
                 last = (op, off, operands)
                 if op.startswith("invoke") and ref:
                     callee = self._resolve_method(ref)
@@ -520,6 +532,8 @@ class APGBuilder:
                     g.add_node(STATEMENT, suid, **props)
                     if op in ("new-instance", "const-class", "check-cast") or op.startswith("move-object"):
                         self.stmt_meta[suid] = (op, regs, type_ref, None, None)
+                    if op == "const-class" and type_ref:
+                        self.stmt_meta[suid] = (op, regs, type_ref, None, dalvik.descriptor_to_java(type_ref))
                 if op.startswith("return"):
                     self.returns[muid].append(suid)
                 if op.startswith(("return", "throw")):
@@ -646,6 +660,16 @@ class APGBuilder:
                         g.add_edge("DATA_DEP", d, suid, reg=_reg_name(u))
                 call = self._call_args.pop(suid, None)
                 if call:
+                    # Constant arguments as properties, e.g. getLastKnownLocation("gps")
+                    consts = []
+                    for pos, u in enumerate(uses):
+                        ds = state.get(u, ())
+                        if len(ds) == 1:
+                            meta = self.stmt_meta.get(next(iter(ds)))
+                            if meta and meta[0].startswith("const") and meta[4] is not None:
+                                consts.append(f"{pos}={str(meta[4]).replace(';', ',')}")
+                    if consts:
+                        g.nodes[STATEMENT][suid]["const_args"] = consts
                     callee_uid, args = call
                     callee_params = {idx: puid for idx, _, puid in self.params.get(callee_uid, [])}
                     for idx, reg in args:
@@ -691,6 +715,65 @@ class APGBuilder:
             logger.enable("androguard")
         self.stats["methods_with_source"] = n
         self.stats["source_seconds"] = round(time.time() - t, 1)
+
+    # ------------------------------------------------------------ method tables
+    def _add_method_tables(self) -> None:
+        """Store each analysed method's own APG as tables on its Method node.
+
+        One method = one APG unit: its AST (statements with operands), control flow,
+        data-flow table and method-call table, as JSON strings. The same information
+        is also present as nodes and edges; the tables make a method self-contained
+        for export, classification and captioning.
+        """
+        import json
+        S = self.g.nodes.get(STATEMENT, {})
+        P = self.g.nodes.get(PARAMETER, {})
+
+        def owner(uid: str) -> str:
+            return uid.rsplit("@", 1)[0] if "@" in uid else uid.rsplit("#", 1)[0]
+
+        def ref(uid: str):
+            if uid in S:
+                return S[uid]["offset"]
+            if uid in P:
+                return f"param{P[uid]['index']}"
+            return None
+
+        ast: dict[str, list] = defaultdict(list)
+        for uid, st in S.items():
+            row = {"off": st["offset"], "op": st["opcode"], "defs": st.get("defs", []), "uses": st.get("uses", [])}
+            for k in ("target", "literal", "type_ref", "value", "const_args"):
+                if st.get(k) is not None:
+                    row[k] = st[k]
+            ast[owner(uid)].append(row)
+        cfg: dict[str, list] = defaultdict(list)
+        for a, b, p in self.g.edges.get("FLOWS_TO", []):
+            row = {"from": S[a]["offset"], "to": S[b]["offset"]}
+            if p.get("branch"):
+                row["branch"] = p["branch"]
+            if p.get("exception"):
+                row["exception"] = True
+            cfg[owner(a)].append(row)
+        dft: dict[str, list] = defaultdict(list)
+        for a, b, p in self.g.edges.get("DATA_DEP", []):
+            dft[owner(b)].append({"from": ref(a), "to": S[b]["offset"], "var": p.get("reg")})
+        calls: dict[str, list] = defaultdict(list)
+        M = self.g.nodes[METHOD]
+        for a, b, p in self.g.edges.get("INVOKES", []):
+            row = {"off": S[a]["offset"], "callee": M[b]["java_signature"]}
+            if p.get("via"):
+                row["via"] = p["via"]
+            if S[a].get("const_args"):
+                row["const_args"] = S[a]["const_args"]
+            calls[owner(a)].append(row)
+        for muid, rows in ast.items():
+            node = M.get(muid)
+            if node is None:
+                continue
+            node["ast_table"] = json.dumps(sorted(rows, key=lambda r: r["off"]))
+            node["cfg_table"] = json.dumps(cfg.get(muid, []))
+            node["data_flow_table"] = json.dumps(dft.get(muid, []))
+            node["method_call_table"] = json.dumps(sorted(calls.get(muid, []), key=lambda r: r["off"]))
 
     # ------------------------------------------------- overrides & entrypoints
     def _add_overrides_and_entrypoints(self) -> None:
